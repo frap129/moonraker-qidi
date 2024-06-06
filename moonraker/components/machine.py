@@ -102,6 +102,13 @@ class Machine:
         self.server.register_endpoint(
             "/machine/system_info", ['GET'],
             self._handle_sysinfo_request)
+        self.server.register_endpoint(
+            "/machine/system_info", ['POST'],
+            self._handle_sysinfo_request)
+        # self.server.register_endpoint(
+            # "/machine/dev_name", ['GET'],
+            # self._handle_devname_request)
+
 
         self.server.register_notification("machine:service_state_changed")
 
@@ -194,7 +201,20 @@ class Machine:
     async def _handle_sysinfo_request(self,
                                       web_request: WebRequest
                                       ) -> Dict[str, Any]:
+        # with open('../../../../../root/www/dev_info.txt', 'r') as f:
+        dev_name = web_request.get_str('dev_name',default=None)
+        if dev_name !=None:
+            Note=open('dev_info.txt',mode='w')   
+            Note.write(dev_name)   
+            Note.close()
+        # path=os.path.abspath('.')
+        with open('dev_info.txt', 'r') as f:         
+            content = f.read() 
+            f.close()
+        self.system_info["machine_name"] =  content            
         return {'system_info': self.system_info}
+
+
 
     def get_system_info(self) -> Dict[str, Any]:
         return self.system_info

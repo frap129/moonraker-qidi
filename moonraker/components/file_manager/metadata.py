@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     pass
 
 UFP_MODEL_PATH = "/3D/model.gcode"
-UFP_THUMB_PATH = "/Metadata/thumbnail.png"
+UFP_THUMB_PATH = "/Metadata/thumbnail.jpg"
 
 def log_to_stderr(msg: str) -> None:
     sys.stderr.write(f"{msg}\n")
@@ -91,7 +91,7 @@ def _regex_find_int(pattern: str, data: str) -> Optional[int]:
 def _regex_find_string(pattern: str, data: str) -> Optional[str]:
     match = re.search(pattern, data)
     if match:
-        return match.group(1)
+        return match.group(1).strip('"')
     return None
 
 # Slicer parsing implementations
@@ -101,6 +101,7 @@ class BaseSlicer(object):
         self.header_data: str = ""
         self.footer_data: str = ""
         self.layer_height: Optional[float] = None
+        self.has_m486_objects: bool = False
 
     def set_data(self,
                  header_data: str,
@@ -136,9 +137,22 @@ class BaseSlicer(object):
                            data: str,
                            pattern: Optional[str] = None
                            ) -> bool:
-        match = re.search(r"\nDEFINE_OBJECT NAME=", data)
+        match = re.search(
+            r"\n((DEFINE_OBJECT)|(EXCLUDE_OBJECT_DEFINE)) NAME=",
+            data
+        )
         if match is not None:
-            # Objects alread processed
+            # Objects already processed
+            fname = os.path.basename(self.path)
+            log_to_stderr(
+                f"File '{fname}' currently supports cancellation, "
+                "processing aborted"
+            )
+            if match.group(1).startswith("DEFINE_OBJECT"):
+                log_to_stderr(
+                    "Legacy object processing detected.  This is not "
+                    "compatible with official versions of Klipper."
+                )
             return False
         # Always check M486
         patterns = [r"\nM486"]
@@ -146,6 +160,7 @@ class BaseSlicer(object):
             patterns.append(pattern)
         for regex in patterns:
             if re.search(regex, data) is not None:
+                self.has_m486_objects = regex == r"\nM486"
                 return True
         return False
 
@@ -195,17 +210,39 @@ class BaseSlicer(object):
     def parse_first_layer_bed_temp(self) -> Optional[float]:
         return None
 
-    def parse_first_layer_extr_temp(self) -> Optional[float]:
+    def parse_chamber_temp(self) -> Optional[float]:
         return None
 
+    def parse_first_layer_extr_temp(self) -> Optional[float]:
+        return None
+    
+    def convert_png_to_jpg(in_path, out_path, size=64, rotate=90):
+        try:
+            with Image.open(in_path) as img:
+                img = img.resize((size, size))
+                img = img.rotate(rotate, expand=True)
+                img = img.convert("RGB")
+                jpg_path = in_path
+                img.save(jpg_path, "JPEG", quality=90)
+        except Exception as e:
+            log_to_stderr(f"convert failed: {e}")
+
     def parse_thumbnails(self) -> Optional[List[Dict[str, Any]]]:
+        is_jpg = False
         for data in [self.header_data, self.footer_data]:
             thumb_matches: List[str] = re.findall(
+                #r"; thumbnail(?:|_JPG) begin[;/\+=\w\s]+?; thumbnail end", data)
                 r"; thumbnail begin[;/\+=\w\s]+?; thumbnail end", data)
-            if thumb_matches:
+            if thumb_matches:  
                 break
-        else:
-            return None
+            else:
+                thumb_matches: List[str] = re.findall(
+                r"; thumbnail_JPG begin[;/\+=\w\s]+?; thumbnail_JPG end", data)
+            if thumb_matches:
+                is_jpg = True
+                break
+            else:
+                return None
         thumb_dir = os.path.join(os.path.dirname(self.path), ".thumbs")
         if not os.path.exists(thumb_dir):
             try:
@@ -215,7 +252,7 @@ class BaseSlicer(object):
                 return None
         thumb_base = os.path.splitext(os.path.basename(self.path))[0]
         parsed_matches: List[Dict[str, Any]] = []
-        has_miniature: bool = False
+        #has_miniature: bool = False
         for match in thumb_matches:
             lines = re.split(r"\r?\n", match.replace('; ', ''))
             info = _regex_find_ints(r".*", lines[0])
@@ -230,7 +267,10 @@ class BaseSlicer(object):
                     f"MetadataError: Thumbnail Size Mismatch: "
                     f"detected {info[2]}, actual {len(data)}")
                 continue
-            thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.png"
+            if not is_jpg:
+                thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.png"
+            else:
+                thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.jpg"
             thumb_path = os.path.join(thumb_dir, thumb_name)
             rel_thumb_path = os.path.join(".thumbs", thumb_name)
             with open(thumb_path, "wb") as f:
@@ -239,33 +279,71 @@ class BaseSlicer(object):
                 'width': info[0], 'height': info[1],
                 'size': os.path.getsize(thumb_path),
                 'relative_path': rel_thumb_path})
-            if info[0] == 32 and info[1] == 32:
-                has_miniature = True
-        if len(parsed_matches) > 0 and not has_miniature:
-            # find the largest thumb index
-            largest_match = parsed_matches[0]
-            for item in parsed_matches:
-                if item['size'] > largest_match['size']:
-                    largest_match = item
-            # Create miniature thumbnail if one does not exist
-            thumb_full_name = largest_match['relative_path'].split("/")[-1]
-            thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
-            rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
-            thumb_path_small = os.path.join(
-                thumb_dir, f"{thumb_base}-32x32.png")
-            # read file
-            try:
-                with Image.open(thumb_path) as im:
-                    # Create 32x32 thumbnail
-                    im.thumbnail((32, 32))
-                    im.save(thumb_path_small, format="PNG")
-                    parsed_matches.insert(0, {
-                        'width': im.width, 'height': im.height,
-                        'size': os.path.getsize(thumb_path_small),
-                        'relative_path': rel_path_small
-                    })
-            except Exception as e:
-                log_to_stderr(str(e))
+        # find the smallest thumb index
+        smallest_match = parsed_matches[0]
+        max_size = min_size = smallest_match['size']
+        for item in parsed_matches:
+            if item['size'] < smallest_match['size']:
+                smallest_match = item
+            if item["size"] < min_size:
+                min_size = item["size"]
+            if item["size"] > max_size:
+                max_size = item["size"]
+        # Create thumbnail for screen
+        thumb_full_name = smallest_match['relative_path'].split("/")[-1]
+        thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
+        thumb_QD_full_name = f"{thumb_base}-{smallest_match['width']}x{smallest_match['height']}_QD.jpg"
+        thumb_QD_path = os.path.join(thumb_dir, f"{thumb_QD_full_name}")
+        rel_path_QD = os.path.join(".thumbs", thumb_QD_full_name)
+        try:
+            with Image.open(thumb_path) as img:
+                img = img.convert("RGB")
+                img = img.resize((smallest_match['width'], smallest_match['height']))
+                img = img.rotate(90, expand=True)
+                img.save(thumb_QD_path, "JPEG", quality=90)
+        except Exception as e:
+            log_to_stderr(f"convert failed: {e}")
+        parsed_matches.append({
+            'width': smallest_match['width'], 'height': smallest_match['height'],
+            'size': (max_size + min_size) // 2,
+            'relative_path': rel_path_QD})
+        #     if info[0] == 32 and info[1] == 32:
+        #         has_miniature = True
+        # if len(parsed_matches) > 0 and not has_miniature:
+        #     # find the largest thumb index
+        #     largest_match = parsed_matches[0]
+        #     for item in parsed_matches:
+        #         if item['size'] > largest_match['size']:
+        #             largest_match = item
+        #     # Create miniature thumbnail if one does not exist
+        #     thumb_full_name = largest_match['relative_path'].split("/")[-1]
+        #     thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
+        #     rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.jpg")
+        #     thumb_path_small = os.path.join(
+        #         thumb_dir, f"{thumb_base}-32x32.jpg")
+        #     rel_path_small_png = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
+        #     thumb_path_small_png = os.path.join(
+        #         thumb_dir, f"{thumb_base}-32x32.png")
+        #     # read file
+        #     try:
+        #         with Image.open(thumb_path) as im:
+        #             # Create 32x32 thumbnail
+        #             im.thumbnail((32, 32))
+        #             im.save(thumb_path_small_png)
+        #             im = im.convert('RGB')
+        #             im.save(thumb_path_small)
+        #             parsed_matches.insert(0, {
+        #                 'width': im.width, 'height': im.height,
+        #                 'size': os.path.getsize(thumb_path_small),
+        #                 'relative_path': rel_path_small
+        #             })
+        #             parsed_matches.insert(0, {
+        #                 'width': im.width, 'height': im.height,
+        #                 'size': os.path.getsize(thumb_path_small_png),
+        #                 'relative_path': rel_path_small_png
+        #             })
+        #     except Exception as e:
+        #         log_to_stderr(str(e))
         return parsed_matches
 
     def parse_layer_count(self) -> Optional[int]:
@@ -292,15 +370,23 @@ class UnknownSlicer(BaseSlicer):
         return _regex_find_first(
             r"M190 S(\d+\.?\d*)", self.header_data)
 
+    def parse_chamber_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r"M191 S(\d+\.?\d*)", self.header_data)
+
     def parse_thumbnails(self) -> Optional[List[Dict[str, Any]]]:
         return None
 
 class PrusaSlicer(BaseSlicer):
     def check_identity(self, data: str) -> Optional[Dict[str, str]]:
         aliases = {
+            'QIDISlicer': r"QIDISlicer\s(.*)\son",
             'PrusaSlicer': r"PrusaSlicer\s(.*)\son",
             'SuperSlicer': r"SuperSlicer\s(.*)\son",
-            'SliCR-3D': r"SliCR-3D\s(.*)\son"
+            'OrcaSlicer': r"OrcaSlicer\s(.*)\son",
+            'SliCR-3D': r"SliCR-3D\s(.*)\son",
+            'BambuStudio': r"BambuStudio[^ ]*\s(.*)\n",
+            'A3dp-Slicer': r"A3dp-Slicer\s(.*)\son",
         }
         for name, expr in aliases.items():
             match = re.search(expr, data)
@@ -357,7 +443,7 @@ class PrusaSlicer(BaseSlicer):
         return _regex_find_string(
             r";\sfilament_type\s=\s(.*)", self.footer_data)
 
-    def parse_filament_name(self) -> Optional[str]:
+    def parse_filament_name(self) -> Optional[str]:       
         return _regex_find_string(
             r";\sfilament_settings_id\s=\s(.*)", self.footer_data)
 
@@ -387,6 +473,10 @@ class PrusaSlicer(BaseSlicer):
         return _regex_find_first(
             r"; first_layer_bed_temperature = (\d+\.?\d*)", self.footer_data)
 
+    def parse_chamber_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r"; chamber_temperature = (\d+\.?\d*)", self.footer_data)
+
     def parse_nozzle_diameter(self) -> Optional[float]:
         return _regex_find_first(
             r";\snozzle_diameter\s=\s(\d+\.\d*)", self.footer_data)
@@ -394,6 +484,14 @@ class PrusaSlicer(BaseSlicer):
     def parse_layer_count(self) -> Optional[int]:
         return _regex_find_int(
             r"; total layers count = (\d+)", self.footer_data)
+
+    def parse_gimage(self) -> Optional[str]:
+        return _regex_find_string(
+            r";gimage:(.*)", self.footer_data)
+
+    def parse_simage(self) -> Optional[str]:
+        return _regex_find_string(
+            r";simage:(.*)", self.footer_data)
 
 class Slic3rPE(PrusaSlicer):
     def check_identity(self, data: str) -> Optional[Dict[str, str]]:
@@ -491,6 +589,10 @@ class Cura(BaseSlicer):
         return _regex_find_first(
             r"M190 S(\d+\.?\d*)", self.header_data)
 
+    def parse_chamber_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r"M191 S(\d+\.?\d*)", self.header_data)
+
     def parse_layer_count(self) -> Optional[int]:
         return _regex_find_int(
             r";LAYER_COUNT\:(\d+)", self.header_data)
@@ -507,10 +609,10 @@ class Cura(BaseSlicer):
         # Check for thumbnails extracted from the ufp
         thumb_dir = os.path.join(os.path.dirname(self.path), ".thumbs")
         thumb_base = os.path.splitext(os.path.basename(self.path))[0]
-        thumb_path = os.path.join(thumb_dir, f"{thumb_base}.png")
-        rel_path_full = os.path.join(".thumbs", f"{thumb_base}.png")
-        rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
-        thumb_path_small = os.path.join(thumb_dir, f"{thumb_base}-32x32.png")
+        thumb_path = os.path.join(thumb_dir, f"{thumb_base}.jpg")
+        rel_path_full = os.path.join(".thumbs", f"{thumb_base}.jpg")
+        rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.jpg")
+        thumb_path_small = os.path.join(thumb_dir, f"{thumb_base}-32x32.jpg")
         if not os.path.isfile(thumb_path):
             return None
         # read file
@@ -524,7 +626,7 @@ class Cura(BaseSlicer):
                 })
                 # Create 32x32 thumbnail
                 im.thumbnail((32, 32), Image.ANTIALIAS)
-                im.save(thumb_path_small, format="PNG")
+                im.save(thumb_path_small, format="JPEG")
                 thumbs.insert(0, {
                     'width': im.width, 'height': im.height,
                     'size': os.path.getsize(thumb_path_small),
@@ -535,10 +637,20 @@ class Cura(BaseSlicer):
             return None
         return thumbs
 
+    def parse_gimage(self) -> Optional[str]:
+        return _regex_find_string(
+            r";gimage:(.*)", self.header_data)
+
+    def parse_simage(self) -> Optional[str]:
+        return _regex_find_string(
+            r";simage:(.*)", self.header_data)
+
 class Simplify3D(BaseSlicer):
     def check_identity(self, data: str) -> Optional[Dict[str, str]]:
         match = re.search(r"Simplify3D\(R\)\sVersion\s(.*)", data)
         if match:
+            self._version = match.group(1)
+            self._is_v5 = self._version.startswith("5")
             return {
                 'slicer': "Simplify3D",
                 'slicer_version': match.group(1)
@@ -558,19 +670,27 @@ class Simplify3D(BaseSlicer):
 
     def parse_filament_total(self) -> Optional[float]:
         return _regex_find_first(
-            r";\s+Filament\slength:\s(\d+\.?\d*)\smm", self.footer_data)
+            r";\s+(?:Filament\slength|Material\sLength):\s(\d+\.?\d*)\smm",
+            self.footer_data
+        )
 
     def parse_filament_weight_total(self) -> Optional[float]:
         return _regex_find_first(
-            r";\s+Plastic\sweight:\s(\d+\.?\d*)\sg", self.footer_data)
+            r";\s+(?:Plastic\sweight|Material\sWeight):\s(\d+\.?\d*)\sg",
+            self.footer_data
+        )
 
     def parse_filament_name(self) -> Optional[str]:
         return _regex_find_string(
             r";\s+printMaterial,(.*)", self.header_data)
 
+    def parse_filament_type(self) -> Optional[str]:
+        return _regex_find_string(
+            r";\s+makerBotModelMaterial,(.*)", self.footer_data)
+
     def parse_estimated_time(self) -> Optional[float]:
         time_match = re.search(
-            r';\s+Build time:.*', self.footer_data)
+            r';\s+Build (t|T)ime:.*', self.footer_data)
         if not time_match:
             return None
         total_time = 0
@@ -603,15 +723,37 @@ class Simplify3D(BaseSlicer):
                     return None
         return None
 
+    def _get_first_layer_temp_v5(self, heater_type: str) -> Optional[float]:
+        pattern = (
+            r";\s+temperatureController,.+?"
+            r";\s+temperatureType,"f"{heater_type}"r".+?"
+            r";\s+temperatureSetpoints,\d+\|(\d+)"
+        )
+        match = re.search(pattern, self.header_data, re.MULTILINE | re.DOTALL)
+        if match is not None:
+            try:
+                return float(match.group(1))
+            except Exception:
+                return None
+        return None
+
     def parse_first_layer_extr_temp(self) -> Optional[float]:
-        return self._get_first_layer_temp("Extruder 1")
+        if self._is_v5:
+            return self._get_first_layer_temp_v5("extruder")
+        else:
+            return self._get_first_layer_temp("Extruder 1")
 
     def parse_first_layer_bed_temp(self) -> Optional[float]:
-        return self._get_first_layer_temp("Heated Bed")
+        if self._is_v5:
+            return self._get_first_layer_temp_v5("platform")
+        else:
+            return self._get_first_layer_temp("Heated Bed")
 
     def parse_nozzle_diameter(self) -> Optional[float]:
         return _regex_find_first(
-            r";\s+extruderDiameter,(\d+\.\d*)", self.header_data)
+            r";\s+(?:extruderDiameter|nozzleDiameter),(\d+\.\d*)",
+            self.header_data
+        )
 
 class KISSlicer(BaseSlicer):
     def check_identity(self, data: str) -> Optional[Dict[str, Any]]:
@@ -661,6 +803,10 @@ class KISSlicer(BaseSlicer):
     def parse_first_layer_bed_temp(self) -> Optional[float]:
         return _regex_find_first(
             r"; bed_C = (\d+\.?\d*)", self.header_data)
+
+    def parse_chamber_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r"; chamber_C = (\d+\.?\d*)", self.header_data)
 
 
 class IdeaMaker(BaseSlicer):
@@ -741,6 +887,10 @@ class IdeaMaker(BaseSlicer):
         return _regex_find_first(
             r"M190 S(\d+\.?\d*)", self.header_data)
 
+    def parse_chamber_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r"M191 S(\d+\.?\d*)", self.header_data)
+
     def parse_nozzle_diameter(self) -> Optional[float]:
         return _regex_find_first(
             r";Dimension:(?:\s\d+\.\d+){3}\s(\d+\.\d+)", self.header_data)
@@ -779,6 +929,10 @@ class IceSL(BaseSlicer):
         return _regex_find_first(
             r";\sbed_temp_degree_c\s:\s+(\d+\.?\d*)", self.header_data)
 
+    def parse_chamber_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r";\schamber_temp_degree_c\s:\s+(\d+\.?\d*)", self.header_data)
+
     def parse_filament_total(self) -> Optional[float]:
         return _regex_find_first(
             r";\sfilament_used_mm\s:\s+(\d+\.\d+)", self.header_data)
@@ -807,13 +961,76 @@ class IceSL(BaseSlicer):
         return _regex_find_first(
             r";\snozzle_diameter_mm_0\s:\s+(\d+\.\d+)", self.header_data)
 
+class KiriMoto(BaseSlicer):
+    def check_identity(self, data) -> Optional[Dict[str, Any]]:
+        variants: Dict[str, str] = {
+            "Kiri:Moto": r"; Generated by Kiri:Moto (\d.+)",
+            "SimplyPrint": r"; Generated by Kiri:Moto \(SimplyPrint\) (.+)"
+        }
+        for name, pattern in variants.items():
+            match = re.search(pattern, data)
+            if match:
+                return {
+                    "slicer": name,
+                    "slicer_version": match.group(1)
+                }
+        return None
+
+    def parse_first_layer_height(self) -> Optional[float]:
+        return _regex_find_first(
+            r"; firstSliceHeight = (\d+\.\d+)", self.header_data
+        )
+
+    def parse_layer_height(self) -> Optional[float]:
+        self.layer_height = _regex_find_first(
+            r"; sliceHeight = (\d+\.\d+)", self.header_data
+        )
+        return self.layer_height
+
+    def parse_object_height(self) -> Optional[float]:
+        return self._parse_max_float(
+            r"G1 Z\d+\.\d+ (?:; z-hop end|F\d+\n)",
+            self.footer_data, strict=True
+        )
+
+    def parse_layer_count(self) -> Optional[int]:
+        matches = re.findall(
+            r";; --- layer (\d+) \(.+", self.footer_data
+        )
+        if not matches:
+            return None
+        try:
+            return int(matches[-1]) + 1
+        except Exception:
+            return None
+
+    def parse_estimated_time(self) -> Optional[float]:
+        return _regex_find_int(r"; --- print time: (\d+)s", self.footer_data)
+
+    def parse_filament_total(self) -> Optional[float]:
+        return _regex_find_first(
+            r"; --- filament used: (\d+\.?\d*) mm", self.footer_data
+        )
+
+    def parse_first_layer_extr_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r"; firstLayerNozzleTemp = (\d+\.?\d*)", self.header_data
+        )
+
+    def parse_first_layer_bed_temp(self) -> Optional[float]:
+        return _regex_find_first(
+            r"; firstLayerBedTemp = (\d+\.?\d*)", self.header_data
+        )
+
 
 READ_SIZE = 512 * 1024
 SUPPORTED_SLICERS: List[Type[BaseSlicer]] = [
     PrusaSlicer, Slic3rPE, Slic3r, Cura, Simplify3D,
-    KISSlicer, IdeaMaker, IceSL
+    KISSlicer, IdeaMaker, IceSL, KiriMoto
 ]
 SUPPORTED_DATA = [
+    'gimage',
+    'simage',
     'gcode_start_byte',
     'gcode_end_byte',
     'layer_count',
@@ -824,25 +1041,55 @@ SUPPORTED_DATA = [
     'first_layer_height',
     'first_layer_extr_temp',
     'first_layer_bed_temp',
+    'chamber_temp',
     'filament_name',
     'filament_type',
     'filament_total',
     'filament_weight_total',
     'thumbnails']
 
-def process_objects(file_path: str) -> bool:
+def process_objects(file_path: str, slicer: BaseSlicer, name: str) -> bool:
     try:
-        from preprocess_cancellation import preprocessor
+        from preprocess_cancellation import (
+            preprocess_slicer,
+            preprocess_cura,
+            preprocess_ideamaker,
+            preprocess_m486
+        )
     except ImportError:
         log_to_stderr("Module 'preprocess-cancellation' failed to load")
         return False
     fname = os.path.basename(file_path)
-    log_to_stderr(f"Performing Object Processing on file: {fname}")
+    log_to_stderr(
+        f"Performing Object Processing on file: {fname}, "
+        f"sliced by {name}"
+    )
     with tempfile.TemporaryDirectory() as tmp_dir_name:
         tmp_file = os.path.join(tmp_dir_name, fname)
         with open(file_path, 'r') as in_file:
             with open(tmp_file, 'w') as out_file:
-                preprocessor(in_file, out_file)
+                try:
+                    if slicer.has_m486_objects:
+                        processor = preprocess_m486
+                    elif isinstance(slicer, PrusaSlicer):
+                        processor = preprocess_slicer
+                    elif isinstance(slicer, Cura):
+                        processor = preprocess_cura
+                    elif isinstance(slicer, IdeaMaker):
+                        processor = preprocess_ideamaker
+                    else:
+                        log_to_stderr(
+                            f"Object Processing Failed, slicer {name}"
+                            "not supported"
+                        )
+                        return False
+                    for line in processor(in_file):
+                        out_file.write(line)
+                except Exception as e:
+                    log_to_stderr(f"Object processing failed: {e}")
+                    return False
+        if os.path.islink(file_path):
+            file_path = os.path.realpath(file_path)
         shutil.move(tmp_file, file_path)
     return True
 
@@ -881,7 +1128,8 @@ def extract_metadata(
     metadata: Dict[str, Any] = {}
     slicer, ident = get_slicer(file_path)
     if check_objects and slicer.has_objects():
-        if process_objects(file_path):
+        name = ident.get("slicer", "unknown")
+        if process_objects(file_path, slicer, name):
             slicer, ident = get_slicer(file_path)
     metadata['size'] = os.path.getsize(file_path)
     metadata['modified'] = os.path.getmtime(file_path)
@@ -899,7 +1147,7 @@ def extract_ufp(ufp_path: str, dest_path: str) -> None:
         log_to_stderr(f"UFP file Not Found: {ufp_path}")
         sys.exit(-1)
     thumb_name = os.path.splitext(
-        os.path.basename(dest_path))[0] + ".png"
+        os.path.basename(dest_path))[0] + ".jpg"
     dest_thumb_dir = os.path.join(os.path.dirname(dest_path), ".thumbs")
     dest_thumb_path = os.path.join(dest_thumb_dir, thumb_name)
     try:
@@ -911,6 +1159,8 @@ def extract_ufp(ufp_path: str, dest_path: str) -> None:
                 if UFP_THUMB_PATH in zf.namelist():
                     tmp_thumb_path = zf.extract(
                         UFP_THUMB_PATH, path=tmp_dir_name)
+            if os.path.islink(dest_path):
+                dest_path = os.path.realpath(dest_path)
             shutil.move(tmp_model_path, dest_path)
             if tmp_thumb_path:
                 if not os.path.exists(dest_thumb_dir):

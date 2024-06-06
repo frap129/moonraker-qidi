@@ -7,6 +7,11 @@
 from __future__ import annotations
 from utils import SentinelClass
 from websockets import WebRequest, Subscribable
+import os
+import shutil
+import time
+import logging
+import json
 
 # Annotation imports
 from typing import (
@@ -23,6 +28,7 @@ if TYPE_CHECKING:
     from confighelper import ConfigHelper
     from websockets import WebRequest
     from klippy_connection import KlippyConnection as Klippy
+    from .file_manager.file_manager import FileManager
     Subscription = Dict[str, Optional[List[Any]]]
     _T = TypeVar("_T")
 
@@ -41,6 +47,7 @@ class KlippyAPI(Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.klippy: Klippy = self.server.lookup_component("klippy_connection")
+        self.fm: FileManager = self.server.lookup_component("file_manager")
         app_args = self.server.get_app_args()
         self.version = app_args.get('software_version')
         # Maintain a subscription for all moonraker requests, as
@@ -110,10 +117,24 @@ class KlippyAPI(Subscribable):
         # Doing so will result in "wait_started" blocking for the specifed
         # timeout (default 20s) and returning False.
         # XXX - validate that file is on disk
+        homedir = os.path.expanduser("~")
         if filename[0] == '/':
             filename = filename[1:]
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
+        if os.path.split(filename)[0].split(os.path.sep)[0] != ".cache":
+            base_path = os.path.join(homedir, "gcode_files")
+            target = os.path.join(".cache", os.path.basename(filename))
+            cache_path = os.path.join(base_path, ".cache")
+            if not os.path.exists(cache_path):
+                os.makedirs(cache_path)
+            shutil.rmtree(cache_path)
+            os.makedirs(cache_path)
+            metadata = self.fm.gcode_metadata.metadata.get(filename, None)
+            self.copy_file_to_cache(os.path.join(base_path, filename), os.path.join(base_path, target))
+            msg = "// metadata=" + json.dumps(metadata)
+            self.server.send_event("server:gcode_response", msg)
+            filename = target
         script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'
         await self.klippy.wait_started()
         return await self.run_gcode(script)
@@ -231,6 +252,17 @@ class KlippyAPI(Subscribable):
                     eventtime: float
                     ) -> None:
         self.server.send_event("server:status_update", status)
+
+    def copy_file_to_cache(self, origin, target):
+        stat = os.statvfs("/")
+        free_space = stat.f_frsize * stat.f_bfree
+        filesize = os.path.getsize(os.path.join(origin))
+        if (filesize < free_space):
+            shutil.copy(origin, target)
+        else:
+            msg = "!! Insufficient disk space, unable to read the file."
+            self.server.send_event("server:gcode_response", msg)
+            raise self.server.error("Insufficient disk space, unable to read the file.", 500)
 
 def load_component(config: ConfigHelper) -> KlippyAPI:
     return KlippyAPI(config)
